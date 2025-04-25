@@ -2,11 +2,19 @@ import pygame
 import json # Import JSON library
 import os   # Import OS library for file existence check
 from math import hypot
+# --- Import the solver function ---
+# Correct function name and import
+try:
+    from dijkstra_grid_solver import calculate_fastest_path
+except ImportError:
+    print("WARNUNG: dijkstra_grid_solver.py nicht gefunden oder 'calculate_fastest_path' Funktion fehlt.")
+    print("Die 'Solve Path' Funktionalität wird nicht verfügbar sein.")
+    calculate_fastest_path = None # Define it as None so checks later don't crash
 
 """
 PREN Wegnetz‑Simulator – Constraint Dragging, Toggle Lock, Target Selection, JSON Load/Save & Path Display
 ----------------------------------------------------------------------------------------------------------
-Version: 8.0
+Version: 8.1 (UI Buttons & Dijkstra Integration)
 
 Features:
 1. Slider‑Bedienung
@@ -46,6 +54,10 @@ MAX_EDGE_LEN = 2.0 # Maximale Kantenlänge (Meter)
 CONSTRAINT_VIOLATION_COLOR = (255, 165, 0) # Orange für verletzte Constraints (visuelles Feedback)
 DEFAULT_CONFIG_FILENAME = "grid_config.json" # Standard-Dateiname für Grid-Konfig
 PATH_SOLUTION_FILENAME = "path_solution.json" # Standard-Dateiname für Pfadlösung
+
+# --- Path Solver Parameters ---
+SPEED_MPS = 1.0            # Speed in meters per second for Dijkstra
+BLOCKADE_PENALTY_S = 5.0   # Time penalty in seconds for state=1 edges
 
 # Zielknoten-Mapping (Taste -> Knoten-Index)
 TARGET_MAP = {
@@ -258,20 +270,68 @@ class ConfigMenu:
         self.scale_slider.val = self.sim.scale
         self.drag_slider.val = self.sim.drag_thr
 
+# ---------- Button UI ----------
+class Button:
+    """ A clickable button with text. """
+    def __init__(self, rect, text, action_id, font,
+                 color=(70, 70, 70), hover_color=(100, 100, 100),
+                 disabled_color=(40, 40, 40), text_color=(255, 255, 255),
+                 disabled_text_color=(100, 100, 100)):
+        self.rect = pygame.Rect(rect)
+        self.text = text
+        self.action_id = action_id # Identifier for the action this button triggers
+        self.font = font
+        self.colors = {
+            "normal": color,
+            "hover": hover_color,
+            "disabled": disabled_color
+        }
+        self.text_colors = {
+            "normal": text_color,
+            "disabled": disabled_text_color
+        }
+        self.is_hovered = False
+        self.is_disabled = False # New state for disabling
+
+    def draw(self, surf):
+        """ Draws the button. """
+        current_color = self.colors["disabled"] if self.is_disabled else (self.colors["hover"] if self.is_hovered else self.colors["normal"])
+        current_text_color = self.text_colors["disabled"] if self.is_disabled else self.text_colors["normal"]
+
+        pygame.draw.rect(surf, current_color, self.rect, border_radius=5)
+        label_render = self.font.render(self.text, True, current_text_color)
+        label_rect = label_render.get_rect(center=self.rect.center)
+        surf.blit(label_render, label_rect)
+
+    def handle_event(self, event):
+        """ Handles mouse events for the button. Returns action_id if clicked. """
+        if self.is_disabled:
+            self.is_hovered = False
+            return None # Ignore events if disabled
+
+        if event.type == pygame.MOUSEMOTION:
+            self.is_hovered = self.rect.collidepoint(event.pos)
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 1 and self.is_hovered:
+                return self.action_id # Signal that the button was clicked
+        return None # No action triggered
+
 # ---------- Simulator ----------
 class Simulator:
     """ Hauptklasse für die Simulation. """
     def __init__(self):
         pygame.init()
-        pygame.display.set_caption("PREN Simulator – v8.0 Path Solution Load/Display")
+        pygame.display.set_caption("PREN Simulator – v8.1 UI Buttons & Dijkstra")
         self.scr = pygame.display.set_mode(SCREEN_SIZE)
         self.font = pygame.font.SysFont("arial", FONT_SIZE)
-        self.info_font = pygame.font.SysFont("arial", INFO_FONT_SIZE, bold=True) # Font für Zeit
+        self.info_font = pygame.font.SysFont("arial", INFO_FONT_SIZE, bold=True)
+        self.button_font = pygame.font.SysFont("arial", 12) # Font for buttons
         self.clock = pygame.time.Clock()
         self.scale = DEFAULT_SCALE
         self.drag_thr = DEFAULT_DRAG_THRESHOLD
         self.cx = SCREEN_SIZE[0] // 2
-        self.cy = 150
+        # Adjusted cy to make space for buttons at bottom and potentially top
+        self.cy = SCREEN_SIZE[1] // 2 - 50 # Center grid more vertically
         self.target_node_id = None
 
         # Grid initialisieren
@@ -284,14 +344,62 @@ class Simulator:
         self.node_initial_logic = (0,0)
 
         # Pfadlösung-Status
-        self.solution_path_nodes = None # Liste von Knoten-IDs
-        self.solution_path_edges = None # Liste von Kanten-IDs
-        self.solution_time = None       # Float-Wert der Zeit
-        self.solution_model = None      # Text-Wert des Models
-        self.show_solution_path = False # Ob der Pfad angezeigt wird
+        self.solution_path_nodes = None
+        self.solution_path_edges = None
+        self.solution_time = None
+        self.solution_model = None # Now stores 'Dijkstra' or 'Loaded' etc.
+        self.show_solution_path = False
 
         self.menu = ConfigMenu(self)
+
+        # --- Button Initialization ---
+        self.buttons = []
+        self._create_buttons() # Call the updated method
+
         self.update_scale(self.scale) # Initiale Positionierung
+
+    def _create_buttons(self):
+        """ Creates and positions the UI buttons with the new layout. """
+        self.buttons.clear()
+        button_h = 28
+        button_w = 90
+        padding = 8
+        v_padding = 5 # Vertical padding for stacked buttons
+
+        # --- Top-Left: Target Buttons (Vertical) ---
+        target_actions = [
+            ("Target A", "TARGET_A"), ("Target B", "TARGET_B"),
+            ("Target C", "TARGET_C"), ("No Target", "TARGET_N")
+        ]
+        x_pos = padding
+        y_pos = padding
+        for text, action_id in target_actions:
+            rect = (x_pos, y_pos, button_w, button_h)
+            self.buttons.append(Button(rect, text, action_id, self.button_font))
+            y_pos += button_h + v_padding
+
+        # --- Below Targets: Path Buttons ---
+        y_pos += padding # Add extra space
+        path_actions = [
+             ("Solve Path (H)", "SOLVE_PATH"), # Changed from TOGGLE_PATH
+             ("Load Path (P)", "LOAD_PATH")
+        ]
+        solve_button_w = button_w + 20 # Make Solve button wider
+        for text, action_id in path_actions:
+             rect = (x_pos, y_pos, solve_button_w, button_h)
+             self.buttons.append(Button(rect, text, action_id, self.button_font))
+             y_pos += button_h + v_padding
+
+
+        # --- Bottom-Right: Utility Buttons (Horizontal) ---
+        utility_actions = [("Save Grid (S)", "SAVE_GRID"), ("Load Grid (L)", "LOAD_GRID"), ("Menu (M)", "TOGGLE_MENU")]
+        total_utility_width = len(utility_actions) * button_w + (len(utility_actions) - 1) * padding
+        x_pos = SCREEN_SIZE[0] - total_utility_width - padding
+        y_pos = SCREEN_SIZE[1] - button_h - padding
+        for text, action_id in utility_actions:
+             rect = (x_pos, y_pos, button_w, button_h)
+             self.buttons.append(Button(rect, text, action_id, self.button_font))
+             x_pos += button_w + padding
 
     def _initialize_grid(self):
         """ Setzt Grid auf Standardzustand zurück. """
@@ -517,57 +625,73 @@ class Simulator:
         model_rect = model_render.get_rect(topright=(SCREEN_SIZE[0] - 15, 45))
         self.scr.blit(model_render, model_rect)
 
-
     # --- Hauptschleife ---
     def run(self):
         """ Startet die Hauptschleife. """
         run = True
         while run:
             # --- Event Handling ---
+            triggered_button_action = None # Store action from button click
+
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:
                     run = False
-                elif ev.type == pygame.KEYDOWN:
-                    if ev.key == pygame.K_m: # Menü-Toggle
-                        self.menu.show = not self.menu.show
-                    elif not self.menu.show: # Nur wenn Menü nicht aktiv ist
-                        if ev.key in TARGET_MAP: # Zielauswahl A, B, C
-                            self._set_target(TARGET_MAP[ev.key])
-                        elif ev.key == pygame.K_n: # Zielauswahl aufheben
-                            self._set_target(None)
-                        elif ev.key == pygame.K_s: # JSON Grid Speichern
-                            self._generate_json_output()
-                        elif ev.key == pygame.K_l: # JSON Grid Laden
-                            self._load_json_config()
-                        # --- Neu: Pfadlösung Laden ---
-                        elif ev.key == pygame.K_p:
-                            self._load_path_solution()
-                        # --- Neu: Pfadanzeige Umschalten ---
-                        elif ev.key == pygame.K_h:
-                            self.show_solution_path = not self.show_solution_path
-                            if self.show_solution_path and self.solution_path_edges is None:
-                                print("Hinweis: Noch keine Pfadlösung geladen (Taste 'P').")
 
-
-                # Events an das Menü weiterleiten
+                # Give events to menu first
                 self.menu.handle(ev)
 
-                # Simulations-Events (wenn Menü nicht aktiv)
+                # Handle Button Events (only if menu is not showing)
                 if not self.menu.show:
-                    if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1: # Linksklick
+                    for button in self.buttons:
+                        # Disable button interaction when menu is shown (Button class handles drawing)
+                        button.is_disabled = self.menu.show
+                        if not button.is_disabled:
+                            action = button.handle_event(ev)
+                            if action:
+                                triggered_button_action = action
+                                break # Process only one button click per event cycle
+
+                # Keyboard Events (process regardless of menu, except for simulation keys)
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_m: # Menu-Toggle (always available)
+                        # Action triggered via button/action logic below
+                        triggered_button_action = "TOGGLE_MENU"
+
+                    elif not self.menu.show: # Only process these if menu is not active
+                        if ev.key == pygame.K_a: triggered_button_action = "TARGET_A"
+                        elif ev.key == pygame.K_b: triggered_button_action = "TARGET_B"
+                        elif ev.key == pygame.K_c: triggered_button_action = "TARGET_C"
+                        elif ev.key == pygame.K_n: triggered_button_action = "TARGET_N"
+                        elif ev.key == pygame.K_s: triggered_button_action = "SAVE_GRID"
+                        elif ev.key == pygame.K_l: triggered_button_action = "LOAD_GRID"
+                        elif ev.key == pygame.K_p: triggered_button_action = "LOAD_PATH"
+                        elif ev.key == pygame.K_h: triggered_button_action = "SOLVE_PATH" # Changed from TOGGLE_PATH
+
+
+                # Simulations-Events (dragging, edge clicks - only if menu is not active and no button was clicked)
+                if not self.menu.show and not triggered_button_action:
+                    # Check if the mouse event is over any button before processing simulation interactions
+                    mouse_pos = pygame.mouse.get_pos()
+                    is_over_button = any(button.rect.collidepoint(mouse_pos) for button in self.buttons)
+
+                    if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and not is_over_button: # Linksklick
                         n = self._node_at(ev.pos)
                         if n and not n.is_start: # Klick auf Knoten
                             self.dragging = n; self.drag_start_pos = ev.pos
                             self.node_start_pos = list(n.pos); self.node_initial_logic = list(n.logic)
                         elif not n: # Klick auf Kante/Leerraum
-                            e = self._edge_at(ev.pos)
-                            if e: e.cycle()
+                             e = self._edge_at(ev.pos)
+                             if e: e.cycle()
 
                     elif ev.type == pygame.MOUSEMOTION and self.dragging:
                         self._drag(ev.pos) # Knoten ziehen
 
                     elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1: # Linke Maustaste losgelassen
-                        if self.dragging:
+                        if self.dragging: # Only process drag release if a node was being dragged
+                            # Check if release happens over a button - if so, discard drag action? Or complete it? Let's complete it.
+                            # is_release_on_button = any(button.rect.collidepoint(ev.pos) for button in self.buttons)
+                            # if not is_release_on_button: # Complete drag only if not releasing on a button
+
                             drag_dist = hypot(ev.pos[0] - self.drag_start_pos[0], ev.pos[1] - self.drag_start_pos[1])
                             was_locked = self.dragging.locked
 
@@ -576,30 +700,123 @@ class Simulator:
                             elif not was_locked: # Längeres Ziehen & nicht gesperrt
                                 dx_screen = ev.pos[0] - self.drag_start_pos[0]; dy_screen = ev.pos[1] - self.drag_start_pos[1]
                                 current_scale = self.scale if self.scale != 0 else 1
-                                if current_scale == 0: self.dragging = None; continue
-                                logic_dx = dx_screen / current_scale; logic_dy = dy_screen / current_scale
-                                final_logic_pos = (self.node_initial_logic[0] + logic_dx, self.node_initial_logic[1] + logic_dy)
-                                if self._check_constraints(self.dragging, final_logic_pos):
-                                    self.dragging.logic = list(final_logic_pos) # Logische Position updaten
-                            # Visuelle Position immer basierend auf (ggf. alter) logischer Position updaten
+                                if current_scale != 0:
+                                    logic_dx = dx_screen / current_scale; logic_dy = dy_screen / current_scale
+                                    final_logic_pos = (self.node_initial_logic[0] + logic_dx, self.node_initial_logic[1] + logic_dy)
+                                    if self._check_constraints(self.dragging, final_logic_pos):
+                                        self.dragging.logic = list(final_logic_pos)
                             self.dragging.update_xy(self.cx, self.cy, self.scale)
-                            self.dragging = None # Ziehvorgang beenden
+                            self.dragging = None
+
+
+            # --- Perform Action Triggered by Button or Key ---
+            if triggered_button_action:
+                print(f"Action triggered: {triggered_button_action}") # Debug print
+                if triggered_button_action == "TARGET_A": self._set_target(TARGET_MAP[pygame.K_a])
+                elif triggered_button_action == "TARGET_B": self._set_target(TARGET_MAP[pygame.K_b])
+                elif triggered_button_action == "TARGET_C": self._set_target(TARGET_MAP[pygame.K_c])
+                elif triggered_button_action == "TARGET_N": self._set_target(None)
+                elif triggered_button_action == "SAVE_GRID": self._generate_json_output()
+                elif triggered_button_action == "LOAD_GRID": self._load_json_config()
+                elif triggered_button_action == "LOAD_PATH":
+                    self._load_path_solution() # Keep existing load functionality
+                    # Ensure model name reflects loading if successful
+                    if self.solution_path_edges is not None:
+                         self.solution_model = "Loaded JSON"
+                    else:
+                         self.solution_model = None # Reset if loading failed
+
+                # --- SOLVE PATH Action (Updated) ---
+                elif triggered_button_action == "SOLVE_PATH":
+                    if calculate_fastest_path is None:
+                         print("Fehler: Dijkstra Solver ('calculate_fastest_path') ist nicht verfügbar.")
+                    elif self.target_node_id is None:
+                         print("Fehler: Bitte zuerst einen Zielknoten auswählen (A, B, C oder Buttons).")
+                         self.solution_path_nodes = None; self.solution_path_edges = None; self.solution_time = None; self.solution_model = None
+                         self.show_solution_path = False
+                    else:
+                        print(f"Starte Pfadberechnung von Knoten 0 nach {self.target_node_id}...")
+
+                        # --- Prepare data for calculate_fastest_path ---
+                        grid_data_for_solver = {
+                            "nodes": [node.to_dict() for node_id, node in sorted(self.nodes.items())],
+                            "edges": [edge.to_dict(self.nodes) for edge_id, edge in sorted(self.edges.items())],
+                            "start_id": 0, # Assuming start is always node 0
+                            "target_id": self.target_node_id,
+                            # Add other info the solver might implicitly use from config, if any
+                            "scale_px_per_m": self.scale,
+                            "drag_threshold_px": self.drag_thr
+                        }
+
+                        try:
+                             # Call the correct function with the structured data and parameters
+                             result_dict = calculate_fastest_path(
+                                 grid_data_for_solver,
+                                 SPEED_MPS,
+                                 BLOCKADE_PENALTY_S
+                             )
+
+                             # --- Process the result dictionary ---
+                             if "error" in result_dict and result_dict["error"] is not None:
+                                 print(f"Fehler bei der Pfadfindung: {result_dict['error']}")
+                                 self.solution_path_nodes = None
+                                 self.solution_path_edges = None
+                                 self.solution_time = None
+                                 self.solution_model = "Dijkstra (Error)"
+                                 self.show_solution_path = False
+                             elif "path_node_ids" in result_dict: # Check for success keys
+                                 self.solution_path_nodes = result_dict["path_node_ids"]
+                                 self.solution_path_edges = result_dict["path_edge_ids"]
+                                 self.solution_time = result_dict["total_time_s"]
+                                 self.solution_model = result_dict.get("model", "Dijkstra") # Use model from result if available
+                                 self.show_solution_path = True
+                                 print(f"Pfadberechnung erfolgreich! Modell: {self.solution_model}. Zeit: {self.solution_time:.2f}s")
+                                 print(f"  Knoten-IDs: {self.solution_path_nodes}")
+                                 print(f"  Kanten-IDs: {self.solution_path_edges}")
+                                 # Optionally print labels if available
+                                 if "path_node_labels" in result_dict:
+                                     print(f"  Knoten-Labels: {result_dict['path_node_labels']}")
+                             else:
+                                 # Should be caught by the "error" check, but just in case
+                                 print("Pfadfindung fehlgeschlagen (Unerwartetes Ergebnisformat).")
+                                 self.solution_path_nodes = None; self.solution_path_edges = None; self.solution_time = None; self.solution_model = "Dijkstra (Failed)"
+                                 self.show_solution_path = False
+
+                        except Exception as e:
+                            print(f"Fehler während des Aufrufs von 'calculate_fastest_path': {e}")
+                            import traceback
+                            traceback.print_exc() # Print detailed traceback
+                            self.solution_path_nodes = None; self.solution_path_edges = None; self.solution_time = None; self.solution_model = "Dijkstra (Crash)"
+                            self.show_solution_path = False
+
+
+                elif triggered_button_action == "TOGGLE_MENU":
+                     self.menu.show = not self.menu.show
+                     # Update button disabled state (redundant with check at event handling start, but safe)
+                     for btn in self.buttons:
+                          btn.is_disabled = self.menu.show
+
 
             # --- Alles zeichnen ---
             self.scr.fill(BG_COLOR)
-            # Normale Kanten zeichnen
+            # Kanten zeichnen
             for e in self.edges.values():
                 e.draw(self.scr, self.nodes, self.font)
-            # --- Neu: Lösungspfad darüber zeichnen ---
+            # Lösungspfad darüber zeichnen (if active)
             self._draw_solution_path()
             # Knoten darüber zeichnen
             for n in self.nodes.values():
                 n.draw(self.scr, self.font)
-            # Menü darüber zeichnen
+
+            # --- Buttons zeichnen ---
+            for button in self.buttons:
+                button.draw(self.scr) # Button draw method handles hover/disabled state
+
+            # Menü darüber zeichnen (if active)
             self.menu.draw(self.scr, self.font)
-            # --- Neu: Lösungszeit darüber zeichnen ---
+            # Lösungszeit darüber zeichnen (if active and available)
             self._draw_solution_time()
-            # --- Neu: Model darüber zeichnen ---
+            # Model darüber zeichnen (if active and available)
             self._draw_solution_model()
 
 
@@ -610,5 +827,13 @@ class Simulator:
 
 # --- Startpunkt des Programms ---
 if __name__ == '__main__':
+    # Update the check for the correct function name
+    if calculate_fastest_path is None:
+         print("-" * 30)
+         print("WARNUNG: 'Solve Path' Funktion ist deaktiviert.")
+         print("Stellen Sie sicher, dass 'dijkstra_grid_solver.py' im selben Verzeichnis ist")
+         print("und eine Funktion 'calculate_fastest_path(data, speed, penalty)' enthält.")
+         print("-" * 30)
+
     sim = Simulator()
     sim.run()
